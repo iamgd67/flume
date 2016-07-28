@@ -22,17 +22,20 @@ import com.google.common.base.Throwables;
 import kafka.javaapi.producer.Producer;
 import kafka.producer.KeyedMessage;
 import kafka.producer.ProducerConfig;
+import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.EncoderFactory;
+import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.flume.*;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.instrumentation.kafka.KafkaSinkCounter;
 import org.apache.flume.sink.AbstractSink;
+import org.apache.flume.source.avro.AvroFlumeEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.Properties;
-import java.util.List;
-import java.util.Map;
-import java.util.ArrayList;
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.util.*;
 
 /**
  * A Flume Sink that can publish messages to Kafka.
@@ -77,6 +80,24 @@ public class KafkaSink extends AbstractSink implements Configurable {
   private KafkaSinkCounter counter;
 
 
+
+  //kafka meesage with header
+  //采用和1.7版本兼容的方式
+
+  ByteArrayOutputStream otstream=new ByteArrayOutputStream(1024);
+  BinaryEncoder encoder;
+  SpecificDatumWriter writer=new SpecificDatumWriter<AvroFlumeEvent>(AvroFlumeEvent.class);
+  private boolean useAvroEvenFormat=false;
+
+  private Map<CharSequence,CharSequence> toCharSeqMap(Map<String,String> map){
+    Map<CharSequence,CharSequence> rst=new HashMap<CharSequence, CharSequence>();
+    for ( Map.Entry<String,String> en:map.entrySet()){
+      rst.put(en.getKey(),en.getValue());
+    }
+    return rst;
+  }
+
+
   @Override
   public Status process() throws EventDeliveryException {
     Status result = Status.READY;
@@ -114,6 +135,16 @@ public class KafkaSink extends AbstractSink implements Configurable {
           logger.debug("{Event} " + eventTopic + " : " + eventKey + " : "
             + new String(eventBody, "UTF-8"));
           logger.debug("event #{}", processedEvents);
+        }
+
+        //include header
+        if(useAvroEvenFormat){
+          otstream.reset();
+          AvroFlumeEvent avroFlumeEvent=new AvroFlumeEvent(toCharSeqMap(headers), ByteBuffer.wrap(eventBody));
+          encoder=EncoderFactory.get().directBinaryEncoder(otstream,encoder);
+          writer.write(avroFlumeEvent,encoder);
+          encoder.flush();
+          eventBody=otstream.toByteArray();
         }
 
         // create a message and add to buffer
@@ -190,6 +221,8 @@ public class KafkaSink extends AbstractSink implements Configurable {
    */
   @Override
   public void configure(Context context) {
+
+    useAvroEvenFormat=context.getBoolean("useFlumeEventFormat",false);
 
     batchSize = context.getInteger(KafkaSinkConstants.BATCH_SIZE,
       KafkaSinkConstants.DEFAULT_BATCH_SIZE);
