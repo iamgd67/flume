@@ -1,40 +1,47 @@
 /**
- Licensed to the Apache Software Foundation (ASF) under one or more
- contributor license agreements.  See the NOTICE file distributed with
- this work for additional information regarding copyright ownership.
- The ASF licenses this file to You under the Apache License, Version 2.0
- (the "License"); you may not use this file except in compliance with
- the License.  You may obtain a copy of the License at
-
- http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
- limitations under the License.
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * limitations under the License.
  */
 
 package org.apache.flume.sink.kafka;
 
 import com.google.common.base.Throwables;
+import com.oasis.logging.kafkasink.MyMessagePartitionerOld;
 import kafka.javaapi.producer.Producer;
 import kafka.producer.KeyedMessage;
 import kafka.producer.ProducerConfig;
+import org.apache.avro.io.BinaryDecoder;
 import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.EncoderFactory;
+import org.apache.avro.specific.SpecificDatumReader;
 import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.flume.*;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.instrumentation.kafka.KafkaSinkCounter;
 import org.apache.flume.sink.AbstractSink;
 import org.apache.flume.source.avro.AvroFlumeEvent;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.PartitionInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayOutputStream;
+import java.io.*;
 import java.nio.ByteBuffer;
+import java.nio.file.*;
 import java.util.*;
 
 /**
@@ -69,186 +76,416 @@ import java.util.*;
  */
 public class KafkaSink extends AbstractSink implements Configurable {
 
-  private static final Logger logger = LoggerFactory.getLogger(KafkaSink.class);
-  public static final String KEY_HDR = "key";
-  public static final String TOPIC_HDR = "topic";
-  private Properties kafkaProps;
-  private Producer<String, byte[]> producer;
-  private String topic;
-  private int batchSize;
-  private List<KeyedMessage<String, byte[]>> messageList;
-  private KafkaSinkCounter counter;
+    private static final Logger logger = LoggerFactory.getLogger(KafkaSink.class);
+    public static final String KEY_HDR = "key";
+    public static final String TOPIC_HDR = "topic";
+    private Properties kafkaProps;
+    private Producer<String, byte[]> producer;
+    private String topic;
+    private int batchSize;
+    private List<KeyedMessage<String, byte[]>> messageList;
+    private KafkaSinkCounter counter;
 
 
+    //kafka meesage with header
+    //采用和1.7版本兼容的方式
 
-  //kafka meesage with header
-  //采用和1.7版本兼容的方式
+    ByteArrayOutputStream otstream = new ByteArrayOutputStream(1024);
+    BinaryEncoder encoder;
+    SpecificDatumWriter writer = new SpecificDatumWriter<AvroFlumeEvent>(AvroFlumeEvent.class);
+    private boolean useAvroEvenFormat = false;
 
-  ByteArrayOutputStream otstream=new ByteArrayOutputStream(1024);
-  BinaryEncoder encoder;
-  SpecificDatumWriter writer=new SpecificDatumWriter<AvroFlumeEvent>(AvroFlumeEvent.class);
-  private boolean useAvroEvenFormat=false;
-
-  private Map<CharSequence,CharSequence> toCharSeqMap(Map<String,String> map){
-    Map<CharSequence,CharSequence> rst=new HashMap<CharSequence, CharSequence>();
-    for ( Map.Entry<String,String> en:map.entrySet()){
-      rst.put(en.getKey(),en.getValue());
+    private Map<CharSequence, CharSequence> toCharSeqMap(Map<String, String> map) {
+        Map<CharSequence, CharSequence> rst = new HashMap<CharSequence, CharSequence>();
+        for (Map.Entry<String, String> en : map.entrySet()) {
+            rst.put(en.getKey(), en.getValue());
+        }
+        return rst;
     }
-    return rst;
-  }
 
 
-  @Override
-  public Status process() throws EventDeliveryException {
-    Status result = Status.READY;
-    Channel channel = getChannel();
-    Transaction transaction = null;
-    Event event = null;
-    String eventTopic = null;
-    String eventKey = null;
+    @Override
+    public Status process() throws EventDeliveryException {
+        Status result = Status.READY;
+        Channel channel = getChannel();
+        Transaction transaction = null;
+        Event event = null;
+        String eventTopic = null;
+        String eventKey = null;
 
-    try {
-      long processedEvents = 0;
+        try {
+            long processedEvents = 0;
 
-      transaction = channel.getTransaction();
-      transaction.begin();
+            transaction = channel.getTransaction();
+            transaction.begin();
 
-      messageList.clear();
-      for (; processedEvents < batchSize; processedEvents += 1) {
-        event = channel.take();
+            messageList.clear();
+            for (; processedEvents < batchSize; processedEvents += 1) {
+                event = channel.take();
 
-        if (event == null) {
-          // no events available in channel
-          break;
+                if (event == null) {
+                    // no events available in channel
+                    break;
+                }
+
+                byte[] eventBody = event.getBody();
+                Map<String, String> headers = event.getHeaders();
+
+                if ((eventTopic = headers.get(TOPIC_HDR)) == null) {
+                    eventTopic = topic;
+                }
+
+                eventKey = headers.get(KEY_HDR);
+
+                if(eventKey==null){
+                    eventKey = getpartition(event)+"";
+                }
+                else{
+                    logger.info("using header topic");
+                }
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug("{Event} " + eventTopic + " : " + eventKey + " : "
+                            + new String(eventBody, "UTF-8"));
+                    logger.debug("event #{}", processedEvents);
+                }
+
+                //include header
+                if (useAvroEvenFormat) {
+                    otstream.reset();
+                    AvroFlumeEvent avroFlumeEvent = new AvroFlumeEvent(toCharSeqMap(headers), ByteBuffer.wrap(eventBody));
+                    encoder = EncoderFactory.get().directBinaryEncoder(otstream, encoder);
+                    writer.write(avroFlumeEvent, encoder);
+                    encoder.flush();
+                    eventBody = otstream.toByteArray();
+                }
+
+                // create a message and add to buffer
+                KeyedMessage<String, byte[]> data = new KeyedMessage<String, byte[]>
+                        (eventTopic, eventKey, eventBody);
+                messageList.add(data);
+
+            }
+
+            // publish batch and commit.
+            if (processedEvents > 0) {
+                long startTime = System.nanoTime();
+                producer.send(messageList);
+                long endTime = System.nanoTime();
+                counter.addToKafkaEventSendTimer((endTime - startTime) / (1000 * 1000));
+                counter.addToEventDrainSuccessCount(Long.valueOf(messageList.size()));
+            }
+
+            transaction.commit();
+
+        } catch (Exception ex) {
+            String errorMsg = "Failed to publish events";
+            logger.error("Failed to publish events", ex);
+            result = Status.BACKOFF;
+            if (transaction != null) {
+                try {
+                    transaction.rollback();
+                    counter.incrementRollbackCount();
+                } catch (Exception e) {
+                    logger.error("Transaction rollback failed", e);
+                    throw Throwables.propagate(e);
+                }
+            }
+            throw new EventDeliveryException(errorMsg, ex);
+        } finally {
+            if (transaction != null) {
+                transaction.close();
+            }
         }
 
-        byte[] eventBody = event.getBody();
-        Map<String, String> headers = event.getHeaders();
+        return result;
+    }
 
-        if ((eventTopic = headers.get(TOPIC_HDR)) == null) {
-          eventTopic = topic;
+    @Override
+    public synchronized void start() {
+        // instantiate the producer
+        ProducerConfig config = new ProducerConfig(kafkaProps);
+        producer = new Producer<String, byte[]>(config);
+        counter.start();
+        super.start();
+    }
+
+
+    /**
+     * need unregist configfile change listenner?
+     */
+
+
+    @Override
+    public synchronized void stop() {
+        producer.close();
+        counter.stop();
+        logger.info("Kafka Sink {} stopped. Metrics: {}", getName(), counter);
+        super.stop();
+    }
+
+
+    /**
+     * We configure the sink and generate properties for the Kafka Producer
+     * <p>
+     * Kafka producer properties is generated as follows:
+     * 1. We generate a properties object with some static defaults that
+     * can be overridden by Sink configuration
+     * 2. We add the configuration users added for Kafka (parameters starting
+     * with .kafka. and must be valid Kafka Producer properties
+     * 3. We add the sink's documented parameters which can override other
+     * properties
+     *
+     * @param context
+     */
+    @Override
+    public void configure(Context context) {
+
+        useAvroEvenFormat = context.getBoolean("useFlumeEventFormat", false);
+
+        batchSize = context.getInteger(KafkaSinkConstants.BATCH_SIZE,
+                KafkaSinkConstants.DEFAULT_BATCH_SIZE);
+        messageList =
+                new ArrayList<KeyedMessage<String, byte[]>>(batchSize);
+        logger.debug("Using batch size: {}", batchSize);
+
+        topic = context.getString(KafkaSinkConstants.TOPIC,
+                KafkaSinkConstants.DEFAULT_TOPIC);
+        if (topic.equals(KafkaSinkConstants.DEFAULT_TOPIC)) {
+            logger.warn("The Property 'topic' is not set. " +
+                    "Using the default topic name: " +
+                    KafkaSinkConstants.DEFAULT_TOPIC);
+        } else {
+            logger.info("Using the static topic: " + topic +
+                    " this may be over-ridden by event headers");
         }
 
-        eventKey = headers.get(KEY_HDR);
+        kafkaProps = KafkaSinkUtil.getKafkaProperties(context);
 
         if (logger.isDebugEnabled()) {
-          logger.debug("{Event} " + eventTopic + " : " + eventKey + " : "
-            + new String(eventBody, "UTF-8"));
-          logger.debug("event #{}", processedEvents);
+            logger.debug("Kafka producer properties: " + kafkaProps);
         }
 
-        //include header
-        if(useAvroEvenFormat){
-          otstream.reset();
-          AvroFlumeEvent avroFlumeEvent=new AvroFlumeEvent(toCharSeqMap(headers), ByteBuffer.wrap(eventBody));
-          encoder=EncoderFactory.get().directBinaryEncoder(otstream,encoder);
-          writer.write(avroFlumeEvent,encoder);
-          encoder.flush();
-          eventBody=otstream.toByteArray();
+        if (counter == null) {
+            counter = new KafkaSinkCounter(getName());
         }
 
-        // create a message and add to buffer
-        KeyedMessage<String, byte[]> data = new KeyedMessage<String, byte[]>
-          (eventTopic, eventKey, eventBody);
-        messageList.add(data);
+        if (MyMessagePartitionerOld.class.getName().equals(kafkaProps.get("partitioner.class"))) {
+            logger.info("using mypartionner");
+            loadpartionmap();
+        }
 
-      }
+    }
 
-      // publish batch and commit.
-      if (processedEvents > 0) {
-        long startTime = System.nanoTime();
-        producer.send(messageList);
-        long endTime = System.nanoTime();
-        counter.addToKafkaEventSendTimer((endTime-startTime)/(1000*1000));
-        counter.addToEventDrainSuccessCount(Long.valueOf(messageList.size()));
-      }
 
-      transaction.commit();
+    Map<String, Object> partionmap = new HashMap<>();
+    public int defaul_part = -1;//random..load balence by app
 
-    } catch (Exception ex) {
-      String errorMsg = "Failed to publish events";
-      logger.error("Failed to publish events", ex);
-      result = Status.BACKOFF;
-      if (transaction != null) {
+    public final String configfilename = "partitionmap.properties";
+    private File configfile = null;
+
+    /**
+     * 加载配置文件
+     */
+
+    public void loadpartionmap() {
+        partionmap.clear();
+        defaul_part = -1;
+        Properties properties = new Properties();
         try {
-          transaction.rollback();
-          counter.incrementRollbackCount();
-        } catch (Exception e) {
-          logger.error("Transaction rollback failed", e);
-          throw Throwables.propagate(e);
+
+            String[] configlocation = {".", "conf", "config", "src" + File.separator + "main" + File.separator + "resources"};
+            File f = null;
+            for (String dir : configlocation) {
+                f = new File(dir + File.separator + configfilename);
+                if (f.exists()) {
+                    break;
+                }
+            }
+            if (f == null) {
+                //no config file find
+                //use balence mod
+                logger.warn("no config file founded,current dir " + new File(".").getAbsolutePath().toString() + ", looking dirs" + configlocation
+                        + ",looking for file " + configfilename + "\nusing app balance mode");
+
+                return;
+            }
+            logger.info("using configfile" + f.getAbsolutePath());
+            configfile = f;
+            properties.load(new FileInputStream(f));
+            Map<String, Object> tmap;
+            for (Map.Entry en : properties.entrySet()) {
+
+                String key = (String) en.getKey();
+
+                if (key.equals("default")) {
+                    if (!en.getValue().equals("random")) {
+                        defaul_part = Integer.parseInt(en.getValue().toString());
+                    }
+                    continue;
+                }
+
+                tmap = partionmap;
+                String[] sks = key.split("\\.");
+                for (int i = 0; i < sks.length - 1; i++) {
+                    String sk = sks[i];
+                    if (tmap.containsKey(sk)) {
+
+                        tmap = (Map<String, Object>) tmap.get(sk);
+                    } else {
+                        Map<String, Object> ttmap = new HashMap<>();
+                        tmap.put(sk, ttmap);
+                        tmap = (Map<String, Object>) tmap.get(sk);
+                    }
+                }
+                tmap.put(sks[sks.length - 1], en.getValue());
+
+            }
+            logger.debug(partionmap.toString());
+            logger.debug(defaul_part + "");
+
+
+            watchconfig();
+
+        } catch (IOException e) {
+            e.printStackTrace();
         }
-      }
-      throw new EventDeliveryException(errorMsg, ex);
-    } finally {
-      if (transaction != null) {
-        transaction.close();
-      }
+
     }
 
-    return result;
-  }
+    private boolean watchstarted = false;
 
-  @Override
-  public synchronized void start() {
-    // instantiate the producer
-    ProducerConfig config = new ProducerConfig(kafkaProps);
-    producer = new Producer<String, byte[]>(config);
-    counter.start();
-    super.start();
-  }
+    /**
+     * 起动线程监视配置文件
+     */
+    synchronized private void watchconfig() {
+        if (watchstarted) {
+            logger.warn("watching thread already started.");
+            return;
+        }
+        watchstarted = true;
+        logger.info("starting watch thread");
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    WatchService watcher = FileSystems.getDefault().newWatchService();
+                    logger.info("watching dir "+configfile.getParent());
+                    Path p = FileSystems.getDefault().getPath(configfile.getParent());
+                    WatchKey key = p.register(watcher, StandardWatchEventKinds.ENTRY_MODIFY);
+                    while (true) {
+                        try {
+                            key = watcher.take();
 
-  @Override
-  public synchronized void stop() {
-    producer.close();
-    counter.stop();
-    logger.info("Kafka Sink {} stopped. Metrics: {}", getName(), counter);
-    super.stop();
-  }
+                            for (WatchEvent event : key.pollEvents()) {
+                                if (event.kind() == StandardWatchEventKinds.ENTRY_MODIFY) {
+                                    Path cp = (Path) event.context();
+                                    if (cp.getFileName().toString().equals(configfilename)) {
+                                        logger.info("config file changed will prepare to reload..");
+                                        configchanged = true;
+                                        break;
+                                    }
+                                    //logger.debug(event+":"+cp.getFileName());
+                                }
+                            }
+                            if (!key.reset()) {
+                                //may be need re regist
+                                break;
+                            }
 
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
 
-  /**
-   * We configure the sink and generate properties for the Kafka Producer
-   *
-   * Kafka producer properties is generated as follows:
-   * 1. We generate a properties object with some static defaults that
-   * can be overridden by Sink configuration
-   * 2. We add the configuration users added for Kafka (parameters starting
-   * with .kafka. and must be valid Kafka Producer properties
-   * 3. We add the sink's documented parameters which can override other
-   * properties
-   *
-   * @param context
-   */
-  @Override
-  public void configure(Context context) {
-
-    useAvroEvenFormat=context.getBoolean("useFlumeEventFormat",false);
-
-    batchSize = context.getInteger(KafkaSinkConstants.BATCH_SIZE,
-      KafkaSinkConstants.DEFAULT_BATCH_SIZE);
-    messageList =
-      new ArrayList<KeyedMessage<String, byte[]>>(batchSize);
-    logger.debug("Using batch size: {}", batchSize);
-
-    topic = context.getString(KafkaSinkConstants.TOPIC,
-      KafkaSinkConstants.DEFAULT_TOPIC);
-    if (topic.equals(KafkaSinkConstants.DEFAULT_TOPIC)) {
-      logger.warn("The Property 'topic' is not set. " +
-        "Using the default topic name: " +
-        KafkaSinkConstants.DEFAULT_TOPIC);
-    } else {
-      logger.info("Using the static topic: " + topic +
-        " this may be over-ridden by event headers");
+            }
+        });
+        t.setDaemon(true);
+        t.start();
     }
 
-    kafkaProps = KafkaSinkUtil.getKafkaProperties(context);
 
-    if (logger.isDebugEnabled()) {
-      logger.debug("Kafka producer properties: " + kafkaProps);
+    private static int toPositive(int number) {
+        return number & 0x7fffffff;
     }
 
-    if (counter == null) {
-      counter = new KafkaSinkCounter(getName());
+    /**
+     * @param app
+     * @param ip
+     * @return -1 or bigger than partion max,shuold handle this
+     */
+
+    volatile boolean configchanged = false;
+
+
+    /**
+     * 通过event获取分区
+     * @param event
+     * @return
+     */
+
+    private int getpartition(Event event) {
+        int p = getpartition(event.getHeaders().get("application"), event.getHeaders().get("hostIP"));
+        logger.debug(p + " : " + event.getHeaders());
+        return p;
+
     }
-  }
+
+
+    /**
+     * 根据配置文件分配partition
+     * 在本进程里重新加载配置，不用每次都lock
+     *
+     * @param app
+     * @param ip
+     * @return 一个正数，需要%分区数
+     */
+    private int getpartition(String app, String ip) {
+        if (configchanged) {
+            loadpartionmap();
+            configchanged = false;
+        }
+        int rst = defaul_part;
+        for (Object rule : partionmap.values()) {
+            Map<String, String> m = (Map<String, String>) rule;
+            if (m.get("app").equals("*") || m.get("app").equals(app)) {
+                if (m.get("ip").equals("*") || m.get("ip").equals(ip)) {
+                    rst = Integer.parseInt(m.get("partition").toString());
+                    break;
+                }
+            }
+        }
+
+        if (rst < 0) {
+            /*按app进行load balance,缓存增加性能？*/
+            if(app==null) app="default app";
+            return toPositive(app.hashCode());
+        }
+
+
+        return rst;
+    }
+
+
+    /**
+     * for junit test
+     *
+     * @param app
+     * @param ip
+     * @return
+     */
+    public int partitiontest(String app, String ip) {
+        int numPartitions = 2;
+        int p = getpartition(app, ip);
+        if (p >= numPartitions) {
+            return p % numPartitions;
+        } else {
+            return p;
+        }
+    }
+
+
 }
