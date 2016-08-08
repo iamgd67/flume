@@ -10,16 +10,25 @@ import org.apache.log4j.Logger;
  */
 public class ConsoleSink extends AbstractSink implements Configurable {
 
-    Logger logger=Logger.getLogger(ConsoleSink.class);
+    Logger logger = Logger.getLogger(ConsoleSink.class);
 
     @Override
     public Status process() throws EventDeliveryException {
         Status result = Status.READY;
 
-        Channel channel=getChannel();
+        Channel channel = getChannel();
+
+        Transaction transaction;
+        transaction = channel.getTransaction();
+        transaction.begin();
         Event event = channel.take();
 
-        System.out.println(event.getHeaders()+":"+event.getBody());
+        if (event != null)
+            logger.info(event.getHeaders() + ":" + event.getBody());
+        else {
+            logger.info("event is null");
+        }
+
 
         try {
             Thread.sleep(10000);
@@ -29,6 +38,8 @@ public class ConsoleSink extends AbstractSink implements Configurable {
             e.printStackTrace();
         }
 
+        transaction.commit();
+        transaction.close();
         return result;
 
     }
