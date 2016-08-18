@@ -23,23 +23,21 @@ import com.oasis.logging.kafkasink.MyMessagePartitionerOld;
 import kafka.javaapi.producer.Producer;
 import kafka.producer.KeyedMessage;
 import kafka.producer.ProducerConfig;
-import org.apache.avro.io.BinaryDecoder;
 import org.apache.avro.io.BinaryEncoder;
-import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.EncoderFactory;
-import org.apache.avro.specific.SpecificDatumReader;
 import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.flume.*;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.instrumentation.kafka.KafkaSinkCounter;
 import org.apache.flume.sink.AbstractSink;
 import org.apache.flume.source.avro.AvroFlumeEvent;
-import org.apache.kafka.common.Cluster;
-import org.apache.kafka.common.PartitionInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.util.*;
@@ -137,10 +135,9 @@ public class KafkaSink extends AbstractSink implements Configurable {
 
                 eventKey = headers.get(KEY_HDR);
 
-                if(eventKey==null){
-                    eventKey = getpartition(event)+"";
-                }
-                else{
+                if (eventKey == null) {
+                    eventKey = getpartition(event) + "";
+                } else {
                     logger.info("using header topic");
                 }
 
@@ -292,27 +289,30 @@ public class KafkaSink extends AbstractSink implements Configurable {
         partionmap.clear();
         defaul_part = -1;
         Properties properties = new Properties();
+
         try {
-
-            String[] configlocation = {".", "conf", "config", "src" + File.separator + "main" + File.separator + "resources"};
-            File f = null;
-            for (String dir : configlocation) {
-                f = new File(dir + File.separator + configfilename);
-                if (f.exists()) {
-                    break;
+            if (configfile == null) {
+                String[] configlocation = {".", "conf", "config", "src" + File.separator + "main" + File.separator + "resources"};
+                File f = null;
+                for (String dir : configlocation) {
+                    f = new File(dir + File.separator + configfilename);
+                    if (f.exists()) {
+                        break;
+                    }
                 }
-            }
-            if (f == null) {
-                //no config file find
-                //use balence mod
-                logger.warn("no config file founded,current dir " + new File(".").getAbsolutePath().toString() + ", looking dirs" + configlocation
-                        + ",looking for file " + configfilename + "\nusing app balance mode");
+                if (!f.exists()) {
+                    //no config file find
+                    //use balence mod
+                    logger.warn("no config file founded,current dir " + new File(".").getAbsolutePath().toString() + ", looking dirs" + configlocation
+                            + ",looking for file " + configfilename + "\nusing app balance mode");
 
-                return;
+                    return;
+                }
+                logger.info("using configfile" + f.getAbsolutePath());
+                configfile = f;
             }
-            logger.info("using configfile" + f.getAbsolutePath());
-            configfile = f;
-            properties.load(new FileInputStream(f));
+
+            properties.load(new FileInputStream(configfile));
             Map<String, Object> tmap;
             for (Map.Entry en : properties.entrySet()) {
 
@@ -347,8 +347,10 @@ public class KafkaSink extends AbstractSink implements Configurable {
 
             watchconfig();
 
-        } catch (IOException e) {
-            e.printStackTrace();
+        } catch (Exception e) {
+            defaul_part=-1;
+            partionmap.clear();
+            logger.error("load parttion map error,using balence mode ",e);
         }
 
     }
@@ -370,7 +372,7 @@ public class KafkaSink extends AbstractSink implements Configurable {
             public void run() {
                 try {
                     WatchService watcher = FileSystems.getDefault().newWatchService();
-                    logger.info("watching dir "+configfile.getParent());
+                    logger.info("watching dir " + configfile.getParent());
                     Path p = FileSystems.getDefault().getPath(configfile.getParent());
                     WatchKey key = p.register(watcher, StandardWatchEventKinds.ENTRY_MODIFY);
                     while (true) {
@@ -423,6 +425,7 @@ public class KafkaSink extends AbstractSink implements Configurable {
 
     /**
      * 通过event获取分区
+     *
      * @param event
      * @return
      */
@@ -461,7 +464,7 @@ public class KafkaSink extends AbstractSink implements Configurable {
 
         if (rst < 0) {
             /*按app进行load balance,缓存增加性能？*/
-            if(app==null) app="default app";
+            if (app == null) app = "default app";
             return toPositive(app.hashCode());
         }
 
